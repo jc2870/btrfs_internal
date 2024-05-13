@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
+#include <assert.h>
 
 #include "btrfs_tree.h"
 #include "btrfs.h"
@@ -22,8 +23,12 @@ do {    \
     fprintf(stderr, "func: %s line: %u\t\tMSG: " fmt, __func__, __LINE__, ##args);   \
 } while(0)
 
+#define BTRFS_FILE_EXTENT_INLINE_DATA_START		\
+		(offsetof(struct btrfs_file_extent_item, disk_bytenr))
+
 static struct btrfs_root_item *fs_root_item = NULL;
 static char file_names[20][20];
+static u32 file_inodes[20];
 static u32 file_num = 0;
 
 typedef void(*btrfs_item_handler)(struct btrfs_fs_info*, struct btrfs_item*, void*);
@@ -294,6 +299,12 @@ void btrfs_root_item_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
     }
 }
 
+static inline char* btrfs_file_extent_inline_start(
+				const struct btrfs_file_extent_item *e)
+{
+	return (char*)e + BTRFS_FILE_EXTENT_INLINE_DATA_START;
+}
+
 void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
 {
     u32 type = item->key.type;
@@ -303,7 +314,39 @@ void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
         struct btrfs_dir_item* dir_item = (struct btrfs_dir_item*)data_ptr;
 
         memcpy(file_names[file_num], (char*)(dir_item+1), dir_item->name_len);
+        file_inodes[file_num] = dir_item->location.objectid;
         file_num++;
+    } else if (type == BTRFS_INODE_ITEM_KEY) {
+        /* See btrfs_read_locked_inode() */
+        struct btrfs_inode_item *inode_item = (struct btrfs_inode_item*)data_ptr;
+        printf("inode: %lld size: %lld mode:0x%x\n", item->key.objectid, inode_item->size, inode_item->mode);
+    }else if (type == BTRFS_EXTENT_DATA_KEY) {
+        struct btrfs_file_extent_item *e_item = (struct btrfs_file_extent_item*)data_ptr;
+        if (e_item->type == BTRFS_FILE_EXTENT_REG || e_item-> type == BTRFS_FILE_EXTENT_PREALLOC) {
+            if (e_item->compression != BTRFS_COMPRESS_NONE) {
+                fprintf(stderr, "don't support compression yet\n");
+                exit(EXIT_FAILURE);
+            }
+            int block_start = e_item->disk_bytenr + e_item->offset;
+            int len = e_item->num_bytes;
+            assert(len == 8192);
+            printf("found file\n");
+            char *data = malloc(8192);
+            pread(fs_info->fd, data, len, btrfs_map_block(fs_info, block_start, len));
+
+            int fd = open("ret", O_CREAT|O_RDWR | O_TRUNC, 0644);
+            check_error(fd < 0, printf("open ret file failed\n"));
+            write(fd, data, len);
+            close(fd);
+
+            free(data);
+        } else if (e_item->type == BTRFS_FILE_EXTENT_INLINE) {
+            int size = e_item->ram_bytes;
+            char *data = malloc(size + 1);
+            memcpy(data,  btrfs_file_extent_inline_start(e_item), size);
+            printf("data: %s", data);
+            free(data);
+        }
     }
 }
 
@@ -344,7 +387,7 @@ static void show_result()
     int i = 0;
 
     for (i = 0; i < file_num; ++i) {
-        printf("%s\n", file_names[i]);
+        printf("inode: %u file:%s\n", file_inodes[i], file_names[i]);
     }
 }
 

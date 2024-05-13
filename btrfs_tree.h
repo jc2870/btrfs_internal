@@ -1130,6 +1130,14 @@ struct btrfs_file_extent_item {
 
 } __attribute__ ((__packed__));
 
+enum btrfs_compression_type {
+	BTRFS_COMPRESS_NONE  = 0,
+	BTRFS_COMPRESS_ZLIB  = 1,
+	BTRFS_COMPRESS_LZO   = 2,
+	BTRFS_COMPRESS_ZSTD  = 3,
+	BTRFS_NR_COMPRESS_TYPES = 4,
+};
+
 struct btrfs_csum_item {
 	__u8 csum;
 } __attribute__ ((__packed__));
