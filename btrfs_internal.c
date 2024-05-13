@@ -19,10 +19,12 @@ do {    \
 
 #define btrfs_err(fmt, args...) \
 do {    \
-    fprintf(stderr, "func: %s line: %u\t\t" fmt, __func__, __LINE__, ##args);   \
+    fprintf(stderr, "func: %s line: %u\t\tMSG: " fmt, __func__, __LINE__, ##args);   \
 } while(0)
 
-void btrfs_read_sb(struct btrfs_super_block *btrfs_sb, const char *img_name)
+#define BTRFS_DEFAULT_NODESIZE 0x4000
+
+int btrfs_read_sb(struct btrfs_super_block *btrfs_sb, const char *img_name)
 {
     int fd;
     int ret;
@@ -32,6 +34,8 @@ void btrfs_read_sb(struct btrfs_super_block *btrfs_sb, const char *img_name)
     ret = pread(fd, btrfs_sb, sizeof(struct btrfs_super_block), BTRFS_SUPER_INFO_OFFSET);
     check_error(ret != sizeof(struct btrfs_super_block), perror("read"));
     check_error(btrfs_sb->magic != BTRFS_MAGIC, btrfs_err("bad magic number\n"));
+
+    return fd;
 }
 
 static inline unsigned long btrfs_chunk_item_size(int num_stripes)
@@ -187,13 +191,79 @@ void btrfs_read_sys_chunk(struct btrfs_super_block *btrfs_sb, struct btrfs_fs_in
     }
 }
 
+// @return: the physical offset corresponding to logical
+u64 btrfs_map_block(struct btrfs_fs_info *fs_info, u64 logical, __le32 length)
+{
+    struct btrfs_chunk_map *map;
+
+    map = btrfs_find_chunk_map_nolock(fs_info, logical, length);
+    check_error(!map, btrfs_err("no mapping from %llu len %u exists\n", logical, length));
+
+    return logical - map->start + map->physical;
+}
+
+void btrfs_read_leaf(struct btrfs_fs_info *fs_info, const char* node_buf, struct btrfs_leaf *leaf)
+{
+    int i = 0;
+    int ret;
+    u32 offset = sizeof(struct btrfs_header);
+
+    while (i < leaf->header.nritems) {
+        leaf->items[i] = *(struct btrfs_item*)(node_buf + offset);
+
+        // only support chunk item
+        if (leaf->items[i].key.type == BTRFS_CHUNK_ITEM_KEY) {
+            struct btrfs_chunk *chunk = (struct btrfs_chunk *)(leaf->items[i].offset + (node_buf + sizeof(struct btrfs_header)));
+
+            btrfs_add_chunk_map(fs_info, (struct btrfs_key*)&leaf->items[i].key, chunk);
+        }
+
+        i++;
+        offset += sizeof(struct btrfs_item);
+    }
+}
+
+// don't support yet
+void btrfs_read_internal_node()
+{
+
+}
+
+void btrfs_read_chunk_tree(struct btrfs_super_block *btrfs_sb, struct btrfs_fs_info *fs_info)
+{
+    const u8 default_chunk_uuid[] = {0x5, 0xf5, 0xe9, 0x21, 0x7, 0x4a, 0x42, 0xe1,
+                                     0xa9, 0x2e, 0x3d, 0x81, 0x76, 0xa8, 0x2c, 0x6c};
+    struct btrfs_header header;
+    char node_buf[BTRFS_DEFAULT_NODESIZE] = {0};
+    struct btrfs_leaf *leaf = NULL;
+    u64 logical = btrfs_sb->chunk_root;
+    u32 length = btrfs_sb->nodesize;
+    int ret;
+    int i;
+
+    ret = pread(fs_info->fd, &node_buf, sizeof(node_buf), btrfs_map_block(fs_info, logical, BTRFS_DEFAULT_NODESIZE));
+    check_error(ret != sizeof(node_buf), btrfs_err("bad read\n"));
+    memcpy(&header, node_buf, sizeof(struct btrfs_header));
+    // Selftest: The data here is the same as the data read from kernel, but uuid check failed... Why?
+    // check_error(memcmp(default_chunk_uuid, header.chunk_tree_uuid, sizeof(default_chunk_uuid)), btrfs_err("bad uuid\n"));
+
+    if (header.level == 0) {
+        leaf = malloc(sizeof(struct btrfs_item) * header.nritems + sizeof(struct btrfs_header));
+        leaf->header = header;
+        btrfs_read_leaf(fs_info, node_buf, leaf);
+    } else {
+        btrfs_read_internal_node();
+    }
+}
+
 int main (int argc, char **argv)
 {
     struct btrfs_super_block btrfs_sb;
     struct btrfs_fs_info fs_info = {0};
 
     check_error(argc != 2, printf("USAGE: %s $btrfs_img\n", argv[0]));
-    btrfs_read_sb(&btrfs_sb, argv[1]);
+    fs_info.fd = btrfs_read_sb(&btrfs_sb, argv[1]);
     btrfs_read_sys_chunk(&btrfs_sb, &fs_info);
+    btrfs_read_chunk_tree(&btrfs_sb, &fs_info);
     return 0;
 }
