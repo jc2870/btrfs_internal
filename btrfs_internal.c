@@ -26,6 +26,8 @@ static struct btrfs_root_item *fs_root_item = NULL;
 static char file_names[20][20];
 static u32 file_num = 0;
 
+typedef void(*btrfs_item_handler)(struct btrfs_fs_info*, struct btrfs_item*, void*);
+
 int btrfs_read_sb(struct btrfs_super_block *btrfs_sb, const char *img_name)
 {
     int fd;
@@ -205,7 +207,7 @@ u64 btrfs_map_block(struct btrfs_fs_info *fs_info, u64 logical, __le32 length)
     return logical - map->start + map->physical;
 }
 
-void btrfs_read_leaf(struct btrfs_fs_info *fs_info, struct btrfs_root *root, struct btrfs_leaf *leaf)
+void btrfs_read_leaf(struct btrfs_fs_info *fs_info, struct btrfs_root *root, struct btrfs_leaf *leaf, btrfs_item_handler item_handler)
 {
     int i = 0;
     int ret;
@@ -219,24 +221,7 @@ void btrfs_read_leaf(struct btrfs_fs_info *fs_info, struct btrfs_root *root, str
         u32 type = leaf->items[i].key.type;
         void* data_ptr = (void*)(leaf->items[i].offset + (node_buf + sizeof(struct btrfs_header)));
 
-        if (type == BTRFS_CHUNK_ITEM_KEY) {
-            // type BTRFS_CHUNK_ITEM_KEY corresponding to struct btrfs_chunk
-            struct btrfs_chunk *chunk = (struct btrfs_chunk *)data_ptr;
-
-            btrfs_add_chunk_map(fs_info, (struct btrfs_key*)&leaf->items[i].key, chunk);
-            memcpy(root->key, &item->key, sizeof(struct btrfs_key));
-        } else if (type == BTRFS_ROOT_ITEM_KEY && item->key.objectid == BTRFS_FS_TREE_OBJECTID) {
-            // type BTRFS_ROOT_ITEM_KEY corresponding to struct btrfs_root_item
-            struct btrfs_root_item *root = (struct btrfs_root_item*)data_ptr;
-
-            fs_root_item = root;
-        } else if (type == BTRFS_DIR_INDEX_KEY) {
-            // type BTRFS_DIR_INDEX_KEY corresponding to struct btrfs_dir_item
-            struct btrfs_dir_item* dir_item = (struct btrfs_dir_item*)data_ptr;
-
-            memcpy(file_names[file_num], (char*)(dir_item+1), dir_item->name_len);
-            file_num++;
-        }
+        item_handler(fs_info, item, data_ptr);
 
         i++;
         offset += sizeof(struct btrfs_item);
@@ -246,10 +231,10 @@ void btrfs_read_leaf(struct btrfs_fs_info *fs_info, struct btrfs_root *root, str
 // don't support yet
 void btrfs_read_internal_node()
 {
-
+    check_error(1, btrfs_err("don't support yet\n"));
 }
 
-void btrfs_read_tree(struct btrfs_root *root, struct btrfs_fs_info *fs_info, u64 logical)
+void btrfs_read_tree(struct btrfs_root *root, struct btrfs_fs_info *fs_info, u64 logical, btrfs_item_handler item_handler)
 {
     struct btrfs_header header;
     char *node_buf = root->node_buf;
@@ -265,7 +250,7 @@ void btrfs_read_tree(struct btrfs_root *root, struct btrfs_fs_info *fs_info, u64
         check_error(!leaf, btrfs_err("oom\n"));
 
         leaf->header = header;
-        btrfs_read_leaf(fs_info, root, leaf);
+        btrfs_read_leaf(fs_info, root, leaf, item_handler);
         root->leaf = leaf;
     } else {
         btrfs_read_internal_node();
@@ -283,34 +268,75 @@ void* btrfs_alloc_root()
     return root;
 }
 
+void btrfs_chunk_item_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
+{
+    u32 type = item->key.type;
+    struct btrfs_chunk* chunk = (struct btrfs_chunk*)data_ptr;
+
+    if (type == BTRFS_CHUNK_ITEM_KEY) {
+        // type BTRFS_CHUNK_ITEM_KEY corresponding to struct btrfs_chunk
+        struct btrfs_chunk *chunk = (struct btrfs_chunk *)data_ptr;
+
+        btrfs_add_chunk_map(fs_info, (struct btrfs_key*)&item->key, chunk);
+        memcpy(fs_info->chunk_root->key, &item->key, sizeof(struct btrfs_key));
+    }
+}
+
+void btrfs_root_item_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
+{
+    u32 type = item->key.type;
+
+    if (type == BTRFS_ROOT_ITEM_KEY && item->key.objectid == BTRFS_FS_TREE_OBJECTID) {
+        // type BTRFS_ROOT_ITEM_KEY corresponding to struct btrfs_root_item
+        struct btrfs_root_item *root = (struct btrfs_root_item*)data_ptr;
+
+        fs_root_item = root;
+    }
+}
+
+void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
+{
+    u32 type = item->key.type;
+
+    if (type == BTRFS_DIR_INDEX_KEY) {
+        // type BTRFS_DIR_INDEX_KEY corresponding to struct btrfs_dir_item
+        struct btrfs_dir_item* dir_item = (struct btrfs_dir_item*)data_ptr;
+
+        memcpy(file_names[file_num], (char*)(dir_item+1), dir_item->name_len);
+        file_num++;
+    }
+}
+
 void btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info)
 {
+#ifdef BTRFS_INTERNAL_TEST
     // The uuid here is result read by kernel
     const u8 testing_chunk_uuid[] = {0x5, 0xf5, 0xe9, 0x21, 0x7, 0x4a, 0x42, 0xe1,
                                      0xa9, 0x2e, 0x3d, 0x81, 0x76, 0xa8, 0x2c, 0x6c};
+#endif
     struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
     struct btrfs_header *header;
 
-    btrfs_read_tree(fs_info->chunk_root, fs_info, btrfs_sb->chunk_root);
-    // Selftest: The result here is the same as data read from kernel, but uuid check failed...Why?
-    // emm. It's a stupid problem, the image read by this code is different with the image read by kernel...
-    // So, the code here is ok.
+    btrfs_read_tree(fs_info->chunk_root, fs_info, btrfs_sb->chunk_root, btrfs_chunk_item_handler);
+
+#ifdef BTRFS_INTERNAL_TEST
     header = (struct btrfs_header*)fs_info->chunk_root->node_buf;
     check_error(memcmp(testing_chunk_uuid, header->chunk_tree_uuid, sizeof(testing_chunk_uuid)), btrfs_err("bad uuid\n"));
+#endif
 }
 
 static void btrfs_read_root_tree(struct btrfs_fs_info *fs_info)
 {
     struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
 
-    btrfs_read_tree(fs_info->roots, fs_info, btrfs_sb->root);
+    btrfs_read_tree(fs_info->roots, fs_info, btrfs_sb->root, btrfs_root_item_handler);
 }
 
 static void btrfs_read_fs_tree(struct btrfs_fs_info *fs_info)
 {
     struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
 
-    btrfs_read_tree(fs_info->fs_root, fs_info, fs_root_item->bytenr);
+    btrfs_read_tree(fs_info->fs_root, fs_info, fs_root_item->bytenr, btrfs_dir_index_handler);
 }
 
 static void show_result()
