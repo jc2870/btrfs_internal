@@ -8,6 +8,7 @@
 
 #include "btrfs_tree.h"
 #include "extent_map.h"
+#include "vfs.h"
 
 /*
  * Since we search a directory based on f_pos (struct dir_context::pos) we have
@@ -15,13 +16,6 @@
  * everybody else has to start at 2 (see btrfs_real_readdir() and dir_emit_dots()).
  */
 #define BTRFS_DIR_START_INDEX 2
-
-#define offsetof(type, member_name) \
-    (size_t) &(((type*)0)->member_name)
-
-#define container_of(ptr, type, member_name) \
-    (type*)((char*)ptr - offsetof(type, member_name))
-
 
 /*
  * ordered_data_close is set by truncate when a file that used
@@ -95,9 +89,6 @@ struct btrfs_inode {
 
 	/* the extent_tree has caches of all the extent mappings to disk */
 	struct extent_map_tree extent_tree;
-
-	/* the io_tree does range state (DIRTY, LOCKED etc) */
-	struct extent_io_tree io_tree;
 
 	/*
 	 * Keep track of where the inode has extent items mapped in order to
@@ -242,8 +233,6 @@ struct btrfs_inode {
 	u32 flags;
 	/* Read-only compatibility flags, upper half of inode_item::flags */
 	u32 ro_flags;
-
-	struct btrfs_block_rsv block_rsv;
 
 	struct btrfs_delayed_node *delayed_node;
 

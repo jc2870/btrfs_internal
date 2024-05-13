@@ -2,7 +2,7 @@
 /*
   Red Black Trees
   (C) 1999  Andrea Arcangeli <andrea@suse.de>
-  
+
 
   linux/include/linux/rbtree.h
 
@@ -21,21 +21,7 @@
 #include <linux/stddef.h>
 
 #include "rbtree_types.h"
-
-#define bool char
-
-#define true 1
-#define false 0
-
-#define WRITE_ONCE(x, val)						\
-do {									\
-	*(volatile typeof(x) *)&(x) = (val);				\
-} while (0)
-
- 
-#define container_of(ptr, type, member) ({			\
-	const typeof( ((type *)0)->member ) *__mptr = (ptr);	\
-	(type *)( (char *)__mptr - offsetof(type,member) );})
+#include "../types.h"
 
 #define rb_parent(r)   ((struct rb_node *)((r)->__rb_parent_color & ~3))
 

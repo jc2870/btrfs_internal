@@ -9,6 +9,11 @@
 
 #include "btrfs_tree.h"
 #include "btrfs.h"
+#include "lib.h"
+#include "types.h"
+#include "vfs.h"
+
+DECLARE_HASHTABLE(inodes_hlist, 10);
 
 #define check_error(cond, error) \
 do {    \
@@ -32,6 +37,11 @@ static u32 file_inodes[20];
 static u32 file_num = 0;
 
 typedef void(*btrfs_item_handler)(struct btrfs_fs_info*, struct btrfs_item*, void*);
+
+static inline u64 inode_hash(u64 ino)
+{
+    return crc64(&ino, sizeof(ino));
+}
 
 int btrfs_read_sb(struct btrfs_super_block *btrfs_sb, const char *img_name)
 {
@@ -319,7 +329,7 @@ void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
     } else if (type == BTRFS_INODE_ITEM_KEY) {
         /* See btrfs_read_locked_inode() */
         struct btrfs_inode_item *inode_item = (struct btrfs_inode_item*)data_ptr;
-        printf("inode: %lld size: %lld mode:0x%x\n", item->key.objectid, inode_item->size, inode_item->mode);
+        // printf("inode: %lld size: %lld mode:0x%x\n", item->key.objectid, inode_item->size, inode_item->mode);
     }else if (type == BTRFS_EXTENT_DATA_KEY) {
         struct btrfs_file_extent_item *e_item = (struct btrfs_file_extent_item*)data_ptr;
         if (e_item->type == BTRFS_FILE_EXTENT_REG || e_item-> type == BTRFS_FILE_EXTENT_PREALLOC) {
@@ -344,7 +354,7 @@ void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
             int size = e_item->ram_bytes;
             char *data = malloc(size + 1);
             memcpy(data,  btrfs_file_extent_inline_start(e_item), size);
-            printf("data: %s", data);
+            // printf("data: %s", data);
             free(data);
         }
     }
@@ -352,20 +362,10 @@ void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
 
 void btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info)
 {
-#ifdef BTRFS_INTERNAL_TEST
-    // The uuid here is result read by kernel
-    const u8 testing_chunk_uuid[] = {0x5, 0xf5, 0xe9, 0x21, 0x7, 0x4a, 0x42, 0xe1,
-                                     0xa9, 0x2e, 0x3d, 0x81, 0x76, 0xa8, 0x2c, 0x6c};
-#endif
     struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
     struct btrfs_header *header;
 
     btrfs_read_tree(fs_info->chunk_root, fs_info, btrfs_sb->chunk_root, btrfs_chunk_item_handler);
-
-#ifdef BTRFS_INTERNAL_TEST
-    header = (struct btrfs_header*)fs_info->chunk_root->node_buf;
-    check_error(memcmp(testing_chunk_uuid, header->chunk_tree_uuid, sizeof(testing_chunk_uuid)), btrfs_err("bad uuid\n"));
-#endif
 }
 
 static void btrfs_read_root_tree(struct btrfs_fs_info *fs_info)
@@ -385,10 +385,47 @@ static void btrfs_read_fs_tree(struct btrfs_fs_info *fs_info)
 static void show_result()
 {
     int i = 0;
+    struct inode *inode;
 
-    for (i = 0; i < file_num; ++i) {
-        printf("inode: %u file:%s\n", file_inodes[i], file_names[i]);
+    hash_for_each(inodes_hlist, i, inode, i_htnode) {
+        printf("inode: %lu, name %s\n", inode->i_ino, inode->i_name);
     }
+}
+
+static void init()
+{
+    crc_init();
+    hash_init(inodes_hlist);
+}
+
+static void alloc_and_init_inode(struct btrfs_dir_item *dir_item)
+{
+    struct inode *inode = malloc(sizeof(*inode));
+    memset(inode, 0, sizeof(*inode));
+    inode->i_ino = dir_item->location.objectid;
+    hash_add(inodes_hlist, &inode->i_htnode, inode_hash(inode->i_ino));
+    inode->i_name = malloc(dir_item->name_len + 1);
+    inode->i_name[dir_item->name_len] = '\0';
+    memcpy(inode->i_name, (char*)(dir_item+1), dir_item->name_len);
+}
+
+void get_all_inodes_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
+{
+    u32 type = item->key.type;
+
+    if (type == BTRFS_DIR_INDEX_KEY) {
+        // type BTRFS_DIR_INDEX_KEY corresponding to struct btrfs_dir_item
+        struct btrfs_dir_item* dir_item = (struct btrfs_dir_item*)data_ptr;
+
+        alloc_and_init_inode(dir_item);
+    }
+}
+
+static void get_all_inodes(struct btrfs_fs_info *fs_info)
+{
+    struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
+
+    btrfs_read_tree(fs_info->fs_root, fs_info, fs_root_item->bytenr, get_all_inodes_handler);
 }
 
 int main (int argc, char **argv)
@@ -397,6 +434,7 @@ int main (int argc, char **argv)
     struct btrfs_fs_info *fs_info;
 
     check_error(argc != 2, printf("USAGE: %s $btrfs_img\n", argv[0]));
+    init();
 
     fs_info = malloc(sizeof(*fs_info));
     check_error(!fs_info, btrfs_err("oom\n"));
@@ -413,6 +451,7 @@ int main (int argc, char **argv)
     // The root tree
     btrfs_read_root_tree(fs_info);
     btrfs_read_fs_tree(fs_info);
+    get_all_inodes(fs_info);
 
     show_result();
     return 0;

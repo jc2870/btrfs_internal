@@ -1,4 +1,4 @@
-OBJS=btrfs_internal.o rbtree/rbtree.o
+OBJS=btrfs_internal.o rbtree/rbtree.o lib.o
 CC=gcc
 CFLAGS=-ggdb
 
