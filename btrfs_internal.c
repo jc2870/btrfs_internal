@@ -23,6 +23,8 @@ do {    \
 } while(0)
 
 static struct btrfs_root_item *fs_root_item = NULL;
+static char file_names[20][20];
+static u32 file_num = 0;
 
 int btrfs_read_sb(struct btrfs_super_block *btrfs_sb, const char *img_name)
 {
@@ -228,6 +230,12 @@ void btrfs_read_leaf(struct btrfs_fs_info *fs_info, struct btrfs_root *root, str
             struct btrfs_root_item *root = (struct btrfs_root_item*)data_ptr;
 
             fs_root_item = root;
+        } else if (type == BTRFS_DIR_INDEX_KEY) {
+            // type BTRFS_DIR_INDEX_KEY corresponding to struct btrfs_dir_item
+            struct btrfs_dir_item* dir_item = (struct btrfs_dir_item*)data_ptr;
+
+            memcpy(file_names[file_num], (char*)(dir_item+1), dir_item->name_len);
+            file_num++;
         }
 
         i++;
@@ -298,6 +306,22 @@ static void btrfs_read_root_tree(struct btrfs_fs_info *fs_info)
     btrfs_read_tree(fs_info->roots, fs_info, btrfs_sb->root);
 }
 
+static void btrfs_read_fs_tree(struct btrfs_fs_info *fs_info)
+{
+    struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
+
+    btrfs_read_tree(fs_info->fs_root, fs_info, fs_root_item->bytenr);
+}
+
+static void show_result()
+{
+    int i = 0;
+
+    for (i = 0; i < file_num; ++i) {
+        printf("%s\n", file_names[i]);
+    }
+}
+
 int main (int argc, char **argv)
 {
     struct btrfs_super_block btrfs_sb;
@@ -319,6 +343,8 @@ int main (int argc, char **argv)
     btrfs_read_chunk_tree(fs_info);
     // The root tree
     btrfs_read_root_tree(fs_info);
+    btrfs_read_fs_tree(fs_info);
 
+    show_result();
     return 0;
 }
