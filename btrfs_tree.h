@@ -879,7 +879,7 @@ struct btrfs_inode_item {
 	__le64 generation;
 	/* transid that last touched this inode */
 	__le64 transid;
-	__le64 size;
+	__le64 size;	// inode size
 	__le64 nbytes;
 	__le64 block_group;
 	__le32 nlink;

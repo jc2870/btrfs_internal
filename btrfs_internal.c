@@ -6,14 +6,21 @@
 #include <unistd.h>
 #include <limits.h>
 #include <assert.h>
+#include <sys/stat.h>
 
 #include "btrfs_tree.h"
 #include "btrfs.h"
 #include "lib.h"
 #include "types.h"
 #include "vfs.h"
+#include "btrfs_inode.h"
 
-DECLARE_HASHTABLE(inodes_hlist, 10);
+#define BTRFS_HASH_BITS 10
+#define BTRFS_ROOT_INO 256
+#define MAX_PATH_LEN 256
+
+DECLARE_HASHTABLE(inodes_hlist, BTRFS_HASH_BITS);
+DEFINE_FREE(free, char*, if (_T) free(_T))
 
 #define check_error(cond, error) \
 do {    \
@@ -35,6 +42,11 @@ static struct btrfs_root_item *fs_root_item = NULL;
 static char file_names[20][20];
 static u32 file_inodes[20];
 static u32 file_num = 0;
+static u32 inodes_num = 0;
+static const char *restore_path = NULL;
+static struct node *alloc_node();
+static struct btrfs_fs_info *fs_info = NULL;
+static void get_all_inodes_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr);
 
 typedef void(*btrfs_item_handler)(struct btrfs_fs_info*, struct btrfs_item*, void*);
 
@@ -217,7 +229,7 @@ u64 btrfs_map_block(struct btrfs_fs_info *fs_info, u64 logical, __le32 length)
     struct btrfs_chunk_map *map;
 
     map = btrfs_find_chunk_map_nolock(fs_info, logical, length);
-    check_error(!map, btrfs_err("no mapping from %llu len %u exists\n", logical, length));
+    check_error(!map, btrfs_err("no mapping from %lu len %u exists\n", logical, length));
 
     return logical - map->start + map->physical;
 }
@@ -225,15 +237,13 @@ u64 btrfs_map_block(struct btrfs_fs_info *fs_info, u64 logical, __le32 length)
 void btrfs_read_leaf(struct btrfs_fs_info *fs_info, struct btrfs_root *root, struct btrfs_leaf *leaf, btrfs_item_handler item_handler)
 {
     int i = 0;
-    int ret;
     u32 offset = sizeof(struct btrfs_header);
     struct btrfs_item *item = NULL;
-    const char* node_buf = root->node_buf;
+    const char* node_buf = (const char*)leaf;
 
     while (i < leaf->header.nritems) {
         item = (struct btrfs_item*)(node_buf + offset);
         leaf->items[i] = *item;
-        u32 type = leaf->items[i].key.type;
         void* data_ptr = (void*)(leaf->items[i].offset + (node_buf + sizeof(struct btrfs_header)));
 
         item_handler(fs_info, item, data_ptr);
@@ -243,32 +253,62 @@ void btrfs_read_leaf(struct btrfs_fs_info *fs_info, struct btrfs_root *root, str
     }
 }
 
-// don't support yet
-void btrfs_read_internal_node()
+static __always_inline struct btrfs_key_ptr *
+nr_key_ptr(struct btrfs_node* node, int n)
 {
-    check_error(1, btrfs_err("don't support yet\n"));
+    int s_header = sizeof(struct btrfs_header);
+    int s_key = sizeof(struct btrfs_key_ptr);
+    return (struct btrfs_key_ptr*)(((char*)node) + s_header + s_key*n);
 }
 
-void btrfs_read_tree(struct btrfs_root *root, struct btrfs_fs_info *fs_info, u64 logical, btrfs_item_handler item_handler)
+static inline void btrfs_read_node(char *dst, int bytenr)
 {
-    struct btrfs_header header;
-    char *node_buf = root->node_buf;
-    struct btrfs_leaf *leaf = NULL;
-    int ret;
+    int offset = btrfs_map_block(fs_info, bytenr, BTRFS_DEFAULT_NODESIZE);
+    int ret = pread(fs_info->fd, dst, BTRFS_DEFAULT_NODESIZE, offset);
+    check_error(ret != BTRFS_DEFAULT_NODESIZE, btrfs_err("short read\n"));
+}
 
-    ret = pread(fs_info->fd, node_buf, BTRFS_DEFAULT_NODESIZE, btrfs_map_block(fs_info, logical, BTRFS_DEFAULT_NODESIZE));
-    check_error(ret != BTRFS_DEFAULT_NODESIZE, btrfs_err("bad read\n"));
-    memcpy(&header, node_buf, sizeof(struct btrfs_header));
+void btrfs_read_internal_node(struct btrfs_root *root, struct btrfs_node *internal_node)
+{
+    int i = 0;
 
-    if (header.level == 0) {
-        leaf = malloc(sizeof(struct btrfs_item) * header.nritems + sizeof(struct btrfs_header));
-        check_error(!leaf, btrfs_err("oom\n"));
+    for (i = 0; i < internal_node->header.nritems; ++i) {
+        struct btrfs_key_ptr *key_ptr = nr_key_ptr(internal_node, i);
+        struct node *node = alloc_node();
+        check_error(!node, btrfs_err("oom\n"));
+        btrfs_read_node(node->data, key_ptr->blockptr);
+        if (((struct btrfs_header*)node->data)->level == 0) {
+            list_add_tail(&node->list, &root->leaf_nodes);
+        } else {
+            btrfs_read_internal_node(root, (void*)node);
+            free(node);
+        }
+    }
+}
 
-        leaf->header = header;
-        btrfs_read_leaf(fs_info, root, leaf, item_handler);
-        root->leaf = leaf;
+static struct node *alloc_node()
+{
+    struct node *node = malloc(sizeof(*node));
+    check_error(!node, printf("oom\n"));
+    memset(node, 0, sizeof(*node));
+    INIT_LIST_HEAD(&node->list);
+
+    return node;
+}
+
+void btrfs_read_tree(struct btrfs_root *root, struct btrfs_fs_info *fs_info, u64 logical)
+{
+    struct btrfs_header *header;
+    struct node *node = alloc_node();
+
+    btrfs_read_node(node->data, logical);
+    header = (struct btrfs_header*)node->data;
+
+    if (header->level == 0) {
+        list_add_tail(&node->list, &root->leaf_nodes);
     } else {
-        btrfs_read_internal_node();
+        btrfs_read_internal_node(root, (void*)node->data);
+        free(node);
     }
 }
 
@@ -276,9 +316,7 @@ void* btrfs_alloc_root()
 {
     struct btrfs_root *root= malloc(sizeof(*root));
     check_error(!root, btrfs_err("oom\n"));
-
-    root->key = malloc(sizeof(struct btrfs_key));
-    check_error(!root->key, btrfs_err("oom\n"));
+    INIT_LIST_HEAD(&root->leaf_nodes);
 
     return root;
 }
@@ -286,14 +324,12 @@ void* btrfs_alloc_root()
 void btrfs_chunk_item_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
 {
     u32 type = item->key.type;
-    struct btrfs_chunk* chunk = (struct btrfs_chunk*)data_ptr;
 
     if (type == BTRFS_CHUNK_ITEM_KEY) {
         // type BTRFS_CHUNK_ITEM_KEY corresponding to struct btrfs_chunk
         struct btrfs_chunk *chunk = (struct btrfs_chunk *)data_ptr;
 
         btrfs_add_chunk_map(fs_info, (struct btrfs_key*)&item->key, chunk);
-        memcpy(fs_info->chunk_root->key, &item->key, sizeof(struct btrfs_key));
     }
 }
 
@@ -329,8 +365,8 @@ void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
     } else if (type == BTRFS_INODE_ITEM_KEY) {
         /* See btrfs_read_locked_inode() */
         struct btrfs_inode_item *inode_item = (struct btrfs_inode_item*)data_ptr;
-        // printf("inode: %lld size: %lld mode:0x%x\n", item->key.objectid, inode_item->size, inode_item->mode);
-    }else if (type == BTRFS_EXTENT_DATA_KEY) {
+        printf("inode: %lld size: %lld mode:0x%x\n", item->key.objectid, inode_item->size, inode_item->mode);
+    } else if (type == BTRFS_EXTENT_DATA_KEY) {
         struct btrfs_file_extent_item *e_item = (struct btrfs_file_extent_item*)data_ptr;
         if (e_item->type == BTRFS_FILE_EXTENT_REG || e_item-> type == BTRFS_FILE_EXTENT_PREALLOC) {
             if (e_item->compression != BTRFS_COMPRESS_NONE) {
@@ -341,20 +377,20 @@ void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
             int len = e_item->num_bytes;
             assert(len == 8192);
             printf("found file\n");
-            char *data = malloc(8192);
+            char *data __free(free) = malloc(8192);
             pread(fs_info->fd, data, len, btrfs_map_block(fs_info, block_start, len));
 
-            int fd = open("ret", O_CREAT|O_RDWR | O_TRUNC, 0644);
+            int fd = open("ret", O_CREAT | O_RDWR | O_TRUNC, 0644);
             check_error(fd < 0, printf("open ret file failed\n"));
             write(fd, data, len);
             close(fd);
 
-            free(data);
         } else if (e_item->type == BTRFS_FILE_EXTENT_INLINE) {
             int size = e_item->ram_bytes;
             char *data = malloc(size + 1);
             memcpy(data,  btrfs_file_extent_inline_start(e_item), size);
-            // printf("data: %s", data);
+            data[size] = '\0';
+            printf("data: %s", data);
             free(data);
         }
     }
@@ -363,23 +399,35 @@ void btrfs_dir_index_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
 void btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info)
 {
     struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
-    struct btrfs_header *header;
-
-    btrfs_read_tree(fs_info->chunk_root, fs_info, btrfs_sb->chunk_root, btrfs_chunk_item_handler);
+    struct node *node;
+    btrfs_read_tree(fs_info->chunk_root, fs_info, btrfs_sb->chunk_root);
+    list_for_each_entry(node, &fs_info->chunk_root->leaf_nodes, list) {
+        struct btrfs_leaf *leaf = (struct btrfs_leaf*)node->data;
+        btrfs_read_leaf(fs_info, fs_info->chunk_root, leaf, btrfs_chunk_item_handler);
+    }
 }
 
 static void btrfs_read_root_tree(struct btrfs_fs_info *fs_info)
 {
     struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
-
-    btrfs_read_tree(fs_info->roots, fs_info, btrfs_sb->root, btrfs_root_item_handler);
+    struct node *node;
+    btrfs_read_tree(fs_info->roots, fs_info, btrfs_sb->root);
+    list_for_each_entry(node, &fs_info->roots->leaf_nodes, list) {
+        struct btrfs_leaf *leaf = (struct btrfs_leaf*)node->data;
+        btrfs_read_leaf(fs_info, fs_info->roots, leaf, btrfs_root_item_handler);
+    }
+    check_error(fs_root_item == NULL, btrfs_err("cannot find fs root\n"));
 }
 
 static void btrfs_read_fs_tree(struct btrfs_fs_info *fs_info)
 {
-    struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
-
-    btrfs_read_tree(fs_info->fs_root, fs_info, fs_root_item->bytenr, btrfs_dir_index_handler);
+    struct node *node;
+    int i = 0;
+    btrfs_read_tree(fs_info->fs_root, fs_info, fs_root_item->bytenr);
+    list_for_each_entry(node, &fs_info->fs_root->leaf_nodes, list) {
+        i++;
+    }
+    printf("There are %d leaf nodes\n", i);
 }
 
 static void show_result()
@@ -398,49 +446,149 @@ static void init()
     hash_init(inodes_hlist);
 }
 
-static void alloc_and_init_inode(struct btrfs_dir_item *dir_item)
+static void alloc_and_init_inode(struct btrfs_inode_item *inode_item, u64 ino)
 {
-    struct inode *inode = malloc(sizeof(*inode));
-    memset(inode, 0, sizeof(*inode));
-    inode->i_ino = dir_item->location.objectid;
+    struct btrfs_inode *btrfs_inode = malloc(sizeof(*btrfs_inode));
+    struct inode *inode = &btrfs_inode->vfs_inode;
+    memset(btrfs_inode, 0, sizeof(*btrfs_inode));
+    inode->i_ino = ino;
+    if (inode->i_ino == BTRFS_ROOT_INO) {
+        inode->i_parent = NULL;
+        inode->i_name = malloc(2);
+        printf("find root\n");
+        memcpy(inode->i_name, "/", 1);
+        inode->i_name[1] = '\0';
+    }
+    INIT_HLIST_NODE(&inode->i_htnode);
     hash_add(inodes_hlist, &inode->i_htnode, inode_hash(inode->i_ino));
-    inode->i_name = malloc(dir_item->name_len + 1);
-    inode->i_name[dir_item->name_len] = '\0';
-    memcpy(inode->i_name, (char*)(dir_item+1), dir_item->name_len);
+    inode->i_mode = inode_item->mode;
+    inode->i_size = inode_item->size;
 }
 
 void get_all_inodes_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
 {
     u32 type = item->key.type;
 
-    if (type == BTRFS_DIR_INDEX_KEY) {
+    if (type == BTRFS_INODE_ITEM_KEY) {
         // type BTRFS_DIR_INDEX_KEY corresponding to struct btrfs_dir_item
-        struct btrfs_dir_item* dir_item = (struct btrfs_dir_item*)data_ptr;
+        struct btrfs_inode_item *inode_item = (struct btrfs_inode_item*)data_ptr;
+        u64 ino = item->key.objectid;
 
-        alloc_and_init_inode(dir_item);
+        inodes_num++;
+        alloc_and_init_inode(inode_item, ino);
     }
 }
 
 static void get_all_inodes(struct btrfs_fs_info *fs_info)
 {
-    struct btrfs_super_block *btrfs_sb = fs_info->btrfs_sb;
+    struct node *node;
+    list_for_each_entry(node, &fs_info->fs_root->leaf_nodes, list) {
+        struct btrfs_leaf *leaf = (struct btrfs_leaf*)node->data;
+        btrfs_read_leaf(fs_info, fs_info->fs_root, leaf, get_all_inodes_handler);
+    }
 
-    btrfs_read_tree(fs_info->fs_root, fs_info, fs_root_item->bytenr, get_all_inodes_handler);
+    printf("there are %d inodes\n", inodes_num);
+}
+
+static struct inode *get_inode_by_ino(u64 ino)
+{
+    u64 hash = inode_hash(ino);
+    struct hlist_head *hlist = &inodes_hlist[hash_min(hash, BTRFS_HASH_BITS)];
+    struct inode *inode = NULL;
+    hlist_for_each_entry(inode, hlist, i_htnode) {
+        if (inode->i_ino == ino) {
+            return inode;
+        }
+    }
+
+    check_error(1, btrfs_err("cannot find inode for ino:0x%lx\n", ino));
+    return NULL;
+}
+
+void inode_item_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
+{
+    u32 type = item->key.type;
+    if (type == BTRFS_DIR_INDEX_KEY) {
+        /* See btrfs_read_locked_inode() */
+        struct btrfs_dir_item *dir_item = (struct btrfs_dir_item*)data_ptr;
+        u64 ino = dir_item->location.objectid;
+        u64 parent_ino = item->key.objectid;
+        struct inode *inode = get_inode_by_ino(ino);
+        struct inode *parent = get_inode_by_ino(parent_ino);
+
+        inode->i_parent = parent;
+        inode->i_name = malloc(dir_item->name_len + 1);
+        inode->i_name[dir_item->name_len] = '\0';
+        memcpy(inode->i_name, (char*)(dir_item+1), dir_item->name_len);
+    }
+}
+
+static void fill_inodes()
+{
+    struct node *node;
+    list_for_each_entry(node, &fs_info->fs_root->leaf_nodes, list) {
+        struct btrfs_leaf *leaf = (struct btrfs_leaf*)node->data;
+        btrfs_read_leaf(fs_info, fs_info->fs_root, leaf, inode_item_handler);
+    }
+}
+
+static void rebuild_fs_tree(struct inode *dir, const char *name)
+{
+    check_error(!S_ISDIR(dir->i_mode), btrfs_err("not directort\n"));
+    int i = 0;
+    struct inode *inode = NULL;
+    char *path = malloc(MAX_PATH_LEN);
+
+    hash_for_each(inodes_hlist, i, inode, i_htnode) {
+        /* skip other inodes */
+        if (inode->i_parent != dir) {
+            continue;
+        }
+        memset(path, 0, MAX_PATH_LEN);
+        strcpy(path, name);
+        strcat(path, "/");
+        strcat(path, inode->i_name);
+
+        if (S_ISDIR(inode->i_mode)) {
+            check_error(mkdir(path, 0755),
+                {perror("mkdir"); printf("path is %s\n", path);});
+            rebuild_fs_tree(inode, path);
+        } else {
+            int ret = open(path, O_CREAT|O_TRUNC, 0644);
+            check_error(ret == -1,
+                {perror("open"); printf("path is %s, ret: %d\n", path, ret);});
+        }
+    }
+
+    free(path);
+}
+
+static void walk_fs(struct btrfs_fs_info *fs_info)
+{
+    struct inode *root = NULL;
+    get_all_inodes(fs_info);
+    fill_inodes();
+    root = get_inode_by_ino(BTRFS_ROOT_INO);
+    rebuild_fs_tree(root, restore_path);
 }
 
 int main (int argc, char **argv)
 {
     struct btrfs_super_block btrfs_sb;
-    struct btrfs_fs_info *fs_info;
 
-    check_error(argc != 2, printf("USAGE: %s $btrfs_img\n", argv[0]));
+    check_error(argc != 3, printf("USAGE: %s $btrfs_img $restore_path\n", argv[0]));
+    restore_path = argv[2];
     init();
 
+    if (access(restore_path, R_OK|W_OK)) {
+        check_error(1, perror("access"));
+    }
     fs_info = malloc(sizeof(*fs_info));
     check_error(!fs_info, btrfs_err("oom\n"));
 
     fs_info->fd = btrfs_read_sb(&btrfs_sb, argv[1]);
     fs_info->btrfs_sb = &btrfs_sb;
+    fs_info->mapping_tree = RB_ROOT_CACHED;
 
     fs_info->chunk_root = btrfs_alloc_root();
     fs_info->fs_root = btrfs_alloc_root();
@@ -451,8 +599,8 @@ int main (int argc, char **argv)
     // The root tree
     btrfs_read_root_tree(fs_info);
     btrfs_read_fs_tree(fs_info);
-    get_all_inodes(fs_info);
+    walk_fs(fs_info);
 
-    show_result();
+    // show_result();
     return 0;
 }
