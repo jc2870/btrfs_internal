@@ -1,4 +1,3 @@
-#include <asm-generic/errno-base.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -7,6 +6,7 @@
 #include <limits.h>
 #include <assert.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "btrfs_tree.h"
 #include "btrfs.h"
@@ -47,6 +47,7 @@ static const char *restore_path = NULL;
 static struct node *alloc_node();
 static struct btrfs_fs_info *fs_info = NULL;
 static void get_all_inodes_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr);
+static struct inode *get_inode_by_ino(u64 ino);
 
 typedef void(*btrfs_item_handler)(struct btrfs_fs_info*, struct btrfs_item*, void*);
 
@@ -427,7 +428,7 @@ static void btrfs_read_fs_tree(struct btrfs_fs_info *fs_info)
     list_for_each_entry(node, &fs_info->fs_root->leaf_nodes, list) {
         i++;
     }
-    printf("There are %d leaf nodes\n", i);
+    // printf("There are %d leaf nodes\n", i);
 }
 
 static void show_result()
@@ -455,14 +456,35 @@ static void alloc_and_init_inode(struct btrfs_inode_item *inode_item, u64 ino)
     if (inode->i_ino == BTRFS_ROOT_INO) {
         inode->i_parent = NULL;
         inode->i_name = malloc(2);
-        printf("find root\n");
+        // printf("find root\n");
         memcpy(inode->i_name, "/", 1);
         inode->i_name[1] = '\0';
     }
     INIT_HLIST_NODE(&inode->i_htnode);
+    INIT_LIST_HEAD(&inode->i_extents);
     hash_add(inodes_hlist, &inode->i_htnode, inode_hash(inode->i_ino));
     inode->i_mode = inode_item->mode;
     inode->i_size = inode_item->size;
+    inode->i_uid  = inode_item->uid;
+    inode->i_gid  = inode_item->gid;
+    inode->i_atime = inode_item->atime;
+    inode->i_mtime = inode_item->mtime;
+}
+
+static void
+alloc_and_init_extent(struct btrfs_file_extent_item *extent_item, u64 ino, u64 offset)
+{
+    struct extent *extent = malloc(sizeof(*extent));
+    // struct btrfs_file_extent_item *item = malloc(sizeof(*item));
+    struct btrfs_file_extent_item *item = extent_item;
+    struct inode *inode = get_inode_by_ino(ino);
+
+    check_error(!extent || !item, btrfs_err("oom\n"));
+    memset(extent, 0, sizeof(*extent));
+    extent->offset = offset;
+    INIT_LIST_HEAD(&extent->list);
+    extent->extent = item;
+    list_add_tail(&extent->list, &inode->i_extents);
 }
 
 void get_all_inodes_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
@@ -479,6 +501,20 @@ void get_all_inodes_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *it
     }
 }
 
+void get_all_extents_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
+{
+    u32 type = item->key.type;
+
+    if (type == BTRFS_EXTENT_DATA_KEY) {
+        // type BTRFS_DIR_INDEX_KEY corresponding to struct btrfs_dir_item
+        struct btrfs_file_extent_item *extent_item = (struct btrfs_file_extent_item*)data_ptr;
+        u64 ino = item->key.objectid;
+
+        inodes_num++;
+        alloc_and_init_extent(extent_item, ino, item->key.offset);
+    }
+}
+
 static void get_all_inodes(struct btrfs_fs_info *fs_info)
 {
     struct node *node;
@@ -487,7 +523,16 @@ static void get_all_inodes(struct btrfs_fs_info *fs_info)
         btrfs_read_leaf(fs_info, fs_info->fs_root, leaf, get_all_inodes_handler);
     }
 
-    printf("there are %d inodes\n", inodes_num);
+    // printf("there are %d inodes\n", inodes_num);
+}
+
+static void get_all_extents(struct btrfs_fs_info *fs_info)
+{
+    struct node *node;
+    list_for_each_entry(node, &fs_info->fs_root->leaf_nodes, list) {
+        struct btrfs_leaf *leaf = (struct btrfs_leaf*)node->data;
+        btrfs_read_leaf(fs_info, fs_info->fs_root, leaf, get_all_extents_handler);
+    }
 }
 
 static struct inode *get_inode_by_ino(u64 ino)
@@ -532,6 +577,135 @@ static void fill_inodes()
     }
 }
 
+static void restore_metadata(int fd, struct inode *inode)
+{
+    struct timespec times[2];
+
+    fchown(fd, inode->i_uid, inode->i_gid);
+    fchmod(fd, inode->i_mode);
+    times[0].tv_sec = inode->i_atime.sec;
+    times[0].tv_nsec = inode->i_atime.nsec;
+    times[1].tv_sec = inode->i_mtime.sec;
+    times[1].tv_nsec = inode->i_mtime.nsec;
+    futimens(fd, times);
+}
+
+static int read_data_from_disk(void *buf, u64 logical,
+			u64 len)
+{
+    u64 physical;
+	int ret;
+
+	physical = btrfs_map_block(fs_info, logical, len);
+
+	ret = pread(fs_info->fd, buf, len, physical);
+	if (ret < 0) {
+		fprintf(stderr, "Error reading %lu, %d\n", logical,
+			ret);
+		return -EIO;
+	}
+	if (ret != len) {
+		fprintf(stderr,
+			"Short read for %lu, read %d, read_len %lu\n",
+			logical, ret, len);
+		return -EIO;
+	}
+
+    return len;
+}
+
+static void
+copy_one_extent(int fd, struct btrfs_file_extent_item *fi, u64 pos, const char *path)
+{
+    u64 bytenr;
+	u64 ram_size;
+	u64 disk_size;
+	u64 num_bytes;
+	u64 length;
+	u64 size_left;
+	u64 offset;
+	u64 cur;
+    ssize_t total = 0, done;
+	int ret;
+    char *inbuf;
+
+	bytenr    = fi->disk_bytenr;
+	disk_size = fi->disk_num_bytes;
+	ram_size  = fi->ram_bytes;
+	offset    = fi->offset;
+	num_bytes = fi->num_bytes;
+    size_left = disk_size;
+	/* Hole, early exit */
+	if (disk_size == 0)
+		return;
+
+	/* Invalid file extent */
+	if (offset >= disk_size || offset > ram_size) {
+		btrfs_err(
+	"invalid data extent offset, offset %lu disk_size %lu ram_size %lu",
+		      offset, disk_size, ram_size);
+        return;
+	}
+
+	if (offset < disk_size) {
+		bytenr += offset;
+		size_left -= offset;
+	}
+
+    inbuf = malloc(size_left);
+    check_error(!inbuf, btrfs_err("oom\n"));
+
+    cur = bytenr;
+    while (cur < bytenr + size_left) {
+		length = bytenr + size_left - cur;
+		ret = read_data_from_disk(inbuf + cur - bytenr, cur, length);
+		if (ret < 0) {
+			return;
+		}
+		cur += length;
+	}
+
+    while (total < num_bytes) {
+        done = pwrite(fd, inbuf+total, num_bytes-total,
+                    pos+total);
+        if (done < 0) {
+            btrfs_err("cannot write data: %d %m file %s fd %d\n", errno, path, fd);
+            free(inbuf);
+            return;
+        }
+        total += done;
+    }
+
+    free(inbuf);
+}
+
+static void restore_data(int fd, struct inode *inode, const char *path)
+{
+    struct extent *extent;
+    struct btrfs_file_extent_item *fi;
+    list_for_each_entry(extent, &inode->i_extents, list) {
+        fi = extent->extent;
+
+        if (fi->compression != BTRFS_COMPRESS_NONE) {
+            btrfs_err("don't support compression yet\n");
+            return;
+        }
+
+        if (fi->type == BTRFS_FILE_EXTENT_PREALLOC) {
+            continue;
+        }
+
+        if (fi->type == BTRFS_FILE_EXTENT_INLINE) {
+            pwrite(fd,  btrfs_file_extent_inline_start(fi),
+                fi->ram_bytes, extent->offset);
+        } else if (fi->type == BTRFS_FILE_EXTENT_REG) {
+            copy_one_extent(fd, fi, extent->offset, path);
+        } else {
+            btrfs_err("weird extent type:%d for file %s\n", fi->type, path);
+        }
+    }
+}
+
 static void rebuild_fs_tree(struct inode *dir, const char *name)
 {
     check_error(!S_ISDIR(dir->i_mode), btrfs_err("not directort\n"));
@@ -554,9 +728,12 @@ static void rebuild_fs_tree(struct inode *dir, const char *name)
                 {perror("mkdir"); printf("path is %s\n", path);});
             rebuild_fs_tree(inode, path);
         } else {
-            int ret = open(path, O_CREAT|O_TRUNC, 0644);
-            check_error(ret == -1,
-                {perror("open"); printf("path is %s, ret: %d\n", path, ret);});
+            int fd = open(path, O_CREAT|O_TRUNC|O_RDWR, 0666);
+            check_error(fd == -1,
+                {perror("open"); printf("path is %s, ret: %d\n", path, fd);});
+            restore_data(fd, inode, path);
+            restore_metadata(fd, inode);
+            check_error(close(fd), perror("close"));
         }
     }
 
@@ -568,6 +745,7 @@ static void walk_fs(struct btrfs_fs_info *fs_info)
     struct inode *root = NULL;
     get_all_inodes(fs_info);
     fill_inodes();
+    get_all_extents(fs_info);
     root = get_inode_by_ino(BTRFS_ROOT_INO);
     rebuild_fs_tree(root, restore_path);
 }

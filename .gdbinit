@@ -1,2 +1,2 @@
 b main
-set args ~/linux/hda.img
+set args ~/linux/hda.img ./restore

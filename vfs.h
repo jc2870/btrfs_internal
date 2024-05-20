@@ -1,6 +1,7 @@
 #ifndef _VFS_H
 #define _VFS_H
 #include "types.h"
+#include "btrfs_tree.h"
 
 
 // #define S_IFMT  00170000
@@ -24,13 +25,25 @@
 // #define S_ISSOCK(m)	(((m) & S_IFMT) == S_IFSOCK)
 
 struct inode {
-	unsigned long		i_ino;
-	u64			i_size;
-    char *i_name;
-    struct hlist_node i_htnode;
+	unsigned long		    i_ino;
+	u64			            i_size;
+    char *                  i_name;
+    struct hlist_node       i_htnode;
+    struct list_head        i_extents;
 
-    u32 i_mode;
-    struct inode *i_parent;
+    u32                     i_mode;
+    struct inode *          i_parent;
+    u32                     i_uid;
+	u32                     i_gid;
+    struct btrfs_timespec   i_atime;
+	struct btrfs_timespec   i_mtime;
+};
+
+struct btrfs_file_extent_item;
+struct extent {
+    struct list_head list;
+    struct btrfs_file_extent_item *extent;
+    u64 offset;
 };
 
 #endif
