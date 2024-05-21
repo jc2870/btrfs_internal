@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/xattr.h>
 
 #include "btrfs_tree.h"
 #include "btrfs.h"
@@ -462,6 +463,7 @@ static void alloc_and_init_inode(struct btrfs_inode_item *inode_item, u64 ino)
     }
     INIT_HLIST_NODE(&inode->i_htnode);
     INIT_LIST_HEAD(&inode->i_extents);
+    INIT_LIST_HEAD(&inode->i_xattrs);
     hash_add(inodes_hlist, &inode->i_htnode, inode_hash(inode->i_ino));
     inode->i_mode = inode_item->mode;
     inode->i_size = inode_item->size;
@@ -510,7 +512,6 @@ void get_all_extents_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *i
         struct btrfs_file_extent_item *extent_item = (struct btrfs_file_extent_item*)data_ptr;
         u64 ino = item->key.objectid;
 
-        inodes_num++;
         alloc_and_init_extent(extent_item, ino, item->key.offset);
     }
 }
@@ -532,6 +533,59 @@ static void get_all_extents(struct btrfs_fs_info *fs_info)
     list_for_each_entry(node, &fs_info->fs_root->leaf_nodes, list) {
         struct btrfs_leaf *leaf = (struct btrfs_leaf*)node->data;
         btrfs_read_leaf(fs_info, fs_info->fs_root, leaf, get_all_extents_handler);
+    }
+}
+
+static void
+alloc_and_init_xattr(struct btrfs_dir_item *di, u64 ino, u64 total_len)
+{
+    struct inode *inode = get_inode_by_ino(ino);
+    int cur = 0;
+
+    while (cur < total_len) {
+        struct xattr *xattr = malloc(sizeof(*xattr));
+        int name_len = di->name_len;
+        int value_len = di->data_len;
+        int len = 0;
+
+        check_error(!xattr, btrfs_err("oom\n"));
+        xattr->key = malloc(name_len + 1);
+        xattr->value = malloc(value_len + 1);
+        check_error(!xattr->key || !xattr->value, btrfs_err("oom\n"));
+
+        INIT_LIST_HEAD(&xattr->list);
+        memcpy(xattr->key, (char*)(di+1), name_len);
+        xattr->key[name_len] = '\0';
+        memcpy(xattr->value, (char*)(di+1) + name_len, value_len);
+        xattr->value[value_len] = '\0';
+
+        list_add_tail(&xattr->list, &inode->i_xattrs);
+
+        len = sizeof(*di) + name_len + value_len;
+        cur += len;
+        di = (struct btrfs_dir_item*)((char*)di + len);
+    }
+}
+
+void get_all_xattrs_handler(struct btrfs_fs_info *fs_info, struct btrfs_item *item, void *data_ptr)
+{
+    u32 type = item->key.type;
+
+    if (type == BTRFS_XATTR_ITEM_KEY) {
+        struct btrfs_dir_item *di = (struct btrfs_dir_item*)data_ptr;
+        u64 ino = item->key.objectid;
+
+        alloc_and_init_xattr(di, ino, item->size);
+    }
+}
+
+static void get_all_xattrs(struct btrfs_fs_info *fs_info)
+{
+    struct node *node;
+    list_for_each_entry(node, &fs_info->fs_root->leaf_nodes, list) {
+        struct btrfs_leaf *leaf = (struct btrfs_leaf*)node->data;
+
+        btrfs_read_leaf(fs_info, fs_info->fs_root, leaf, get_all_xattrs_handler);
     }
 }
 
@@ -588,6 +642,15 @@ static void restore_metadata(int fd, struct inode *inode)
     times[1].tv_sec = inode->i_mtime.sec;
     times[1].tv_nsec = inode->i_mtime.nsec;
     futimens(fd, times);
+}
+
+static void restore_xattrs(int fd, struct inode *inode)
+{
+    struct xattr *xattr;
+
+    list_for_each_entry(xattr, &inode->i_xattrs, list) {
+        fsetxattr(fd, xattr->key, xattr->value, strlen(xattr->value), 0);
+    }
 }
 
 static int read_data_from_disk(void *buf, u64 logical,
@@ -704,6 +767,8 @@ static void restore_data(int fd, struct inode *inode, const char *path)
             btrfs_err("weird extent type:%d for file %s\n", fi->type, path);
         }
     }
+
+    ftruncate(fd, inode->i_size);
 }
 
 static void rebuild_fs_tree(struct inode *dir, const char *name)
@@ -733,6 +798,7 @@ static void rebuild_fs_tree(struct inode *dir, const char *name)
                 {perror("open"); printf("path is %s, ret: %d\n", path, fd);});
             restore_data(fd, inode, path);
             restore_metadata(fd, inode);
+            restore_xattrs(fd, inode);
             check_error(close(fd), perror("close"));
         }
     }
@@ -746,6 +812,7 @@ static void walk_fs(struct btrfs_fs_info *fs_info)
     get_all_inodes(fs_info);
     fill_inodes();
     get_all_extents(fs_info);
+    get_all_xattrs(fs_info);
     root = get_inode_by_ino(BTRFS_ROOT_INO);
     rebuild_fs_tree(root, restore_path);
 }

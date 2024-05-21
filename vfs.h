@@ -30,6 +30,7 @@ struct inode {
     char *                  i_name;
     struct hlist_node       i_htnode;
     struct list_head        i_extents;
+    struct list_head        i_xattrs;
 
     u32                     i_mode;
     struct inode *          i_parent;
@@ -44,6 +45,13 @@ struct extent {
     struct list_head list;
     struct btrfs_file_extent_item *extent;
     u64 offset;
+};
+
+struct xattr {
+    char *key;
+    char *value;
+
+    struct list_head list;
 };
 
 #endif
