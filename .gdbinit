@@ -1,2 +1,2 @@
 b main
-set args btrfs.img ./restore
+set args ../btrfs.img ../restore

@@ -32,7 +32,8 @@ struct inode {
     struct list_head        i_extents;
     struct list_head        i_xattrs;
 
-    u32                     i_mode;
+    u32                     i_mode;     // from inode item
+    u8                      i_type;     // from index dir item
     struct inode *          i_parent;
     u32                     i_uid;
 	u32                     i_gid;
@@ -44,7 +45,8 @@ struct btrfs_file_extent_item;
 struct extent {
     struct list_head list;
     struct btrfs_file_extent_item *extent;
-    u64 offset;
+    u64 offset;     // for regular file offset
+    u64 size;       // for symlink
 };
 
 struct xattr {
