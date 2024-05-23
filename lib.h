@@ -86,7 +86,7 @@ static __always_inline u32 hash_64_generic(u64 val, unsigned int bits)
 {
     if (sizeof(void*) == 8)
         /* 64x64-bit multiply is efficient on all 64-bit processors */
-        return val * GOLDEN_RATIO_64 >> (64 - bits);
+        return val * (unsigned long long )GOLDEN_RATIO_64 >> (64 - bits);
     else
         /* Hash 64 bits using only 32x32-bit multiply. */
         return hash_32_generic((u32)val ^ __hash_32_generic(val >> 32), bits);
